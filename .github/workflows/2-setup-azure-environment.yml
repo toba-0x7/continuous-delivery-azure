@@ -1,95 +1,94 @@
-name: Check step 2, Set up the Azure environment
+name: Deploy to staging
 
-# This step sets STEP to 3
-# This step closes <details id=2> and opens <details id=3>
-
-# This will run every time we push to the deploy-staging.yml file on the staging-workflow branch
-# Reference https://docs.github.com/en/actions/learn-github-actions/events-that-trigger-workflows
 on:
-  workflow_dispatch:
-  push:
-    branches:
-      - staging-workflow
-    paths:
-      - .github/workflows/deploy-staging.yml
+  pull_request:
+    types: [labeled]
 
-permissions:
-  # Need `contents: read` to checkout the repository
-  # Need `contents: write` to update the step metadata
-  contents: write
-  pull-requests: write
+env:
+  IMAGE_REGISTRY_URL: ghcr.io
+  ###############################################
+  ### Replace <username> with GitHub username ###
+  ###############################################
+  DOCKER_IMAGE_NAME: toba-0x7-azure-ttt
+  AZURE_WEBAPP_NAME: toba-0x7-ttt-app
+  ###############################################
 
 jobs:
-  # The purpose of this job is to output the current step number 
-  # (retreived from the STEP file). This output variable can
-  # then be referenced in other jobs and used in conditional 
-  # expressions.
-  get_current_step:
-    name: Check current step number
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-      - id: get_step
-        run: echo "::set-output name=current_step::$(cat ./.github/script/STEP)"
-    outputs:
-      current_step: ${{ steps.get_step.outputs.current_step }}
+  build:
+    if: contains(github.event.pull_request.labels.*.name, 'stage')
 
-  on_staging_workflow_update:
-    name: On staging workflow update
-    needs: get_current_step
-
-    # We will only run this action when:
-    # 1. This repository isn't the template repository
-    # 2. The STEP is currently 2 (see update-step.sh)
-    # Reference https://docs.github.com/en/actions/learn-github-actions/contexts
-    # Reference https://docs.github.com/en/actions/learn-github-actions/expressions
-    if: ${{ !github.event.repository.is_template && needs.get_current_step.outputs.current_step == 2 }}
-
-    # We'll run Ubuntu for performance instead of Mac or Windows
     runs-on: ubuntu-latest
 
     steps:
-      # We'll need to check out the repository so that we can edit the README
-      - name: Checkout
-        uses: actions/checkout@v2
+      - uses: actions/checkout@v1
+      - name: npm install and build webpack
+        run: |
+          npm install
+          npm run build
+      - uses: actions/upload-artifact@main
         with:
-          fetch-depth: 0 # Let's get all the branches
+          name: webpack artifacts
+          path: public/
 
-      # Verify the learner configured Build-Docker-Image job
-      - name: Verify Build-Docker-Image job
-        run: .github/script/check-file.sh
-        env:
-          FILE: .github/workflows/deploy-staging.yml
-          SEARCH_LIST: 'Build-Docker-Image actions/download-artifact docker/login-action docker/build-push-action'
+  Build-Docker-Image:
+    runs-on: ubuntu-latest
+    needs: build
+    name: Build image and store in GitHub Container Registry
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v1
 
-      # Verify the learner configured the Deploy-to-Azure job
-      - name: Verify Deploy-to-Azure job
-        run: .github/script/check-file.sh
-        env:
-          FILE: .github/workflows/deploy-staging.yml
-          SEARCH_LIST: 'Deploy-to-Azure azure/login azure/webapps-deploy'
+      - name: Download built artifact
+        uses: actions/download-artifact@main
+        with:
+          name: webpack artifacts
+          path: public
 
-      # Merge the pull open pull request
-      - name: Merge Pull Request
-        run: gh pr merge --squash staging-workflow
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to GHCR
+        uses: docker/login-action@v1.14.1
+        with:
+          registry: ${{ env.IMAGE_REGISTRY_URL }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Create pull request from azure-configuration branch to set up next step
-      - name: Create azure-configuration pull request 
-        run: ./.github/script/create-workflow-pr.sh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_BRANCH: azure-configuration
-          PR_TITLE: 'Added spinup-destroy.yml workflow'
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v3.7.0
+        with:
+          images: ${{env.IMAGE_REGISTRY_URL}}/${{ github.repository }}/${{env.DOCKER_IMAGE_NAME}}
+          tags: |
+            type=sha,format=long,prefix=
 
-      # Update README to close <details id=2>
-      # and open <details id=3>
-      # and set STEP to '3'
-      - name: Update to step 3
-        run: ./.github/script/update-step.sh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          FROM_STEP: 2
-          TO_STEP: 3
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v2.10.0
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  Deploy-to-Azure:
+    runs-on: ubuntu-latest
+    needs: Build-Docker-Image
+    name: Deploy app container to Azure
+    steps:
+      - name: "Login via Azure CLI"
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - uses: azure/docker-login@v1
+        with:
+          login-server: ${{env.IMAGE_REGISTRY_URL}}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Deploy web app container
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: ${{env.AZURE_WEBAPP_NAME}}
+          images: ${{env.IMAGE_REGISTRY_URL}}/${{ github.repository }}/${{env.DOCKER_IMAGE_NAME}}:${{ github.sha }}
+
+      - name: Azure logout
+        run: |
+          az logout
